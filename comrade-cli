@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="5.0.2"
+version_number="6.0.0"
 
 # UI
 
@@ -15,7 +15,7 @@ menu() {
     esac
 }
 
-# provide menu. input format is either (ep_list) or (number \t anime_id \t anime_name)
+# provide menu. input format is either (ep_list) or (number \t id \t name)
 nth() {
     _stdin=$(cat -)
     [ -z "$_stdin" ] && return 1
@@ -73,27 +73,21 @@ help_info() {
         Show this help message and exit
       -e, --episode, -r, --range
         Specify the number of episodes to watch
-      --dub
-        Play dubbed version
       --rofi
         Use rofi instead of fzf for the interactive menu
       --dmenu
         Use dmenu instead of fzf for the interactive menu
-      --skip
-        Use ani-skip to skip the intro of the episode (mpv only)
       --no-detach
         Don't detach the player (useful for in-terminal playback, mpv only)
       --exit-after-play
         Exit the player, and return the player exit code (useful for non interactive scenarios)
-      -N, --nextep-countdown
-        Display a countdown to the next episode
       -U, --update
         Update the script
     Some example usages:
-      %s -q 720p banana fish
-      %s --skip -S 2 one piece
-      %s -d -e 2 cyberpunk edgerunners
-      %s --vlc cyberpunk edgerunners -q 1080p -e 4
+      %s -q 720p spy x family
+      %s -S 2 one piece
+      %s -d -e 2 one piece
+      %s --vlc one piece -q 1080p -e 4
       %s blue lock -e 5-6
       %s -e \"5 6\" blue lock
     \n" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}" "${0##*/}"
@@ -109,7 +103,7 @@ version_info() {
 
 update_script() {
     info "[branch:$branch] Checking for Update.."
-    update="$($curl_exe --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/pystardust/ani-cli/$branch/ani-cli")" || die "[branch:$branch] Connection error: $update"
+    update="$(curl --fail-with-body -sL -A "$agent" "https://raw.githubusercontent.com/justchokingaround/comrade-cli/$branch/comrade-cli")" || die "[branch:$branch] Connection error: $update"
     new_version="$(printf "%s" "$update" | sed -nE 's|^version_number="([^"]+)"$|\1|p')"
     [ -z "$new_version" ] && die "[branch:$branch] Invalid response."
     printf "%s" "$update" | grep -q "^version_number" || die "[branch:$branch] Invalid response."
@@ -142,56 +136,83 @@ dep_ch_failover() {
 }
 
 cleanup() {
-    tput sgr0               # clears colors
-    rm -f "${histfile}.new" # remove temp logfile
+    tput sgr0 # clears colors
+    rm -f "${histfile}.new" "$cookie_jar"
 }
 
-# SCRAPING
+# SCRAPING (hdrezka.website)
 
-#shellcheck disable=SC2086
-anidb_curl() {
-    $curl_exe -sL -A "$agent" --max-time 10 $cipher_flag "$@"
+# shellcheck disable=SC2086
+hdrezka_curl() {
+    curl -sL -A "$agent" --compressed --max-time 15 -b "$cookie_jar" -c "$cookie_jar" "$@"
 }
 
-# search the query and give results. format is (id \t name)
-anidb_search() {
+hdrezka_blockcheck() {
+    printf "%s" "$1" | grep -qi 'anubis_challenge\|Just a moment\|Проверяем, что вы не бот' && die "Blocked by hdrezka's anti-bot check. Try again in a bit."
+    return 0
+}
+
+# search the query and give results. format is (id_path \t "title [year] (type)")
+hdrezka_search() {
     #shellcheck disable=SC2059
-    _page="$(anidb_curl "$(printf "$search_api" "$1")" | tr '\n' ' ' | sed 's|<a href|\n<a href|g')"
-    if printf "%s" "$_page" | grep -qi "Just a moment"; then
-        [ "$curl_exe" = "curl" ] && die "Blocked by cloudflare. Try installing curl-impersonate"
-        die "Blocked by cloudflare."
+    _page="$(hdrezka_curl "$(printf "$search_api" "$1")")"
+    hdrezka_blockcheck "$_page"
+    printf "%s" "$_page" | tr '\n' ' ' | sed 's|<div class="b-content__inline_item"|\n<div class="b-content__inline_item"|g' |
+        sed -nE 's@^<div class="b-content__inline_item" data-id="[0-9]+" data-url="https://hdrezka\.website/([^"]+)\.html".*<i class="entity">([^<]*)</i>.*<a href="[^"]*">([^<]*)</a> <div>([0-9]{4})[^<]*</div>.*@\1\t\3 [\4] (\2)@p' |
+        sed -e "s|&#039;|'|g" -e 's|&quot;|"|g' -e 's|&amp;|\&|g'
+}
+
+# fetches the anime page into $anime_page, derives $data_id and $is_movie (1 = single video, no episodes)
+hdrezka_load_page() {
+    anime_page="$(hdrezka_curl "${base_api}/${1}.html")"
+    hdrezka_blockcheck "$anime_page"
+    [ -z "$anime_page" ] && die "Could not load anime page!"
+    data_id="$(printf "%s" "$1" | sed -nE 's@.*/([0-9]+)-.*@\1@p')"
+    if printf "%s" "$anime_page" | grep -q 'data-episode_id='; then is_movie=0; else is_movie=1; fi
+}
+
+# translation studios available for the loaded anime. format is (id \t name)
+# films sneak an extra data-id="..." attribute in before data-translator_id, series don't
+# hdrezka renders the translator picker twice (desktop + mobile variants), so the same
+# data-translator_id shows up more than once and sometimes with an empty title on one of
+# the two; dedupe by id, keeping the first non-empty name and dropping ids that never get one
+hdrezka_translators() {
+    printf "%s" "$anime_page" | tr '\n' ' ' | grep -oE 'title="[^"]*" class="b-translator__item[^"]*"[^>]*data-translator_id="[0-9]+"' |
+        sed -E 's@title="([^"]*)" class="b-translator__item( active)?"[^>]*data-translator_id="([0-9]+)"@\3\t\1@' |
+        awk -F'\t' '!seen[$1]++ { order[++n] = $1 } $2 != "" && !(name[$1]) { name[$1] = $2 } END { for (i = 1; i <= n; i++) { id = order[i]; if (name[id] != "") print id "\t" name[id] } }'
+}
+
+# the id of the translation studio marked as default on the page
+# when there's only one translator, hdrezka omits the b-translator__item list entirely,
+# so fall back to the id embedded in the initCDN(Series|Movies)Events(...) call
+hdrezka_default_translator() {
+    _t="$(printf "%s" "$anime_page" | tr '\n' ' ' | grep -oE 'title="[^"]*" class="b-translator__item active"[^>]*data-translator_id="[0-9]+"' |
+        sed -E 's@.*data-translator_id="([0-9]+)"@\1@' | head -n 1)"
+    [ -z "$_t" ] && _t="$(printf "%s" "$anime_page" | tr '\n' ' ' | sed -nE 's@.*initCDN(Series|Movies)Events\([0-9]+, ([0-9]+),.*@\2@p' | head -n 1)"
+    printf "%s" "$_t"
+}
+
+# seasons embedded in the loaded anime page. format is (id \t name)
+hdrezka_seasons() {
+    printf "%s" "$anime_page" | tr '\n' ' ' | grep -oE 'data-tab_id="[0-9]+"[^>]*>[^<]*' | sed -E 's@data-tab_id="([0-9]+)"[^>]*>@\1\t@'
+}
+
+# episode numbers for the given season id ($1)
+hdrezka_episodes() {
+    printf "%s" "$anime_page" | tr '\n' ' ' | grep -oE 'data-season_id="'"$1"'" data-episode_id="[0-9]+"' | sed -E 's@.*data-episode_id="([0-9]+)"@\1@'
+}
+
+# fetches stream links + subtitle for $1 = episode number (ignored for movies). sets $links and $sub_link
+hdrezka_stream() {
+    if [ "$is_movie" = 1 ]; then
+        _data="$(hdrezka_curl -X POST "${base_api}/ajax/get_cdn_series/" --data-raw "id=${data_id}&translator_id=${translator_id}&action=get_movie")"
+    else
+        _data="$(hdrezka_curl -X POST "${base_api}/ajax/get_cdn_series/" --data-raw "id=${data_id}&translator_id=${translator_id}&season=${season_id}&episode=${1}&action=get_stream")"
     fi
-    printf "%s" "$_page" | sed -nE 's|.*anime/([a-z0-9-]+-[0-9]+)".*alt="([^"]+)".*|\1\t\2|p' | sed -e "s|&#039;|'|g" -e 's|&quot;|"|g'
-}
-
-# extract mal_id and seasons metadata
-anidb_desc() {
-    #shellcheck disable=SC2059
-    _page="$(anidb_curl "$(printf "$desc_api" "$1")" | tr '\n' ' ' | sed 's|<a href|\n<a href|g')"
-    mal_id="$(printf "%s" "$_page" | sed -nE 's|.*https://myanimelist.net/anime/([0-9]+)/.*|\1|p')"
-    seasons="$(printf "%s" "$_page" | sed -n '/>Seasons</,/>Details</p' | sed -nE 's|.*anime/([^"]+-[0-9]+)"[^>]*title="([^"]+)".*|\1\t\2|p' | sed -e "s|&#039;|'|g")"
-    [ -n "$seasons" ] && seasons_option="\nchange_season"
-}
-
-# get the episodes list of the selected anime. format is (id \t ep_no)
-anidb_episodes() {
-    #shellcheck disable=SC2059
-    _page="$(anidb_curl "$(printf "$episodes_api" "${1##*-}")")"
-    printf "%s" "$_page" | sed 's|},{|}\n{|g' | sed -nE 's|.*"id":([0-9]+).*"number":([0-9]+).*|\1\t\2|p'
-}
-
-# extract the individual m3u8 links from response of embed urls
-anidb_m3u8() {
-    _ep_id=$(printf "%s" "$episode_maps" | sed -nE "s|^([0-9]+)\t${1}$|\1|p")
-    _lang="jpn"
-    [ "$2" = "dub" ] && _lang="eng"
-    #shellcheck disable=SC2059
-    _page="$(anidb_curl "$(printf "$m3u8_api" "${_ep_id}")")"
-    _embed="$(printf "%s" "$_page" | sed 's|},{|}\n{|g' | sed -nE 's|.*'"${_lang}"'.*embed_url":"([^"]+)".*|\1|p' | sed 's|\\/|/|g' | head -n 1)"
-    [ -z "$_embed" ] && return 1
-    _embed_page="$(anidb_curl "$_embed")"
-    _m3u8_master="$(printf "%s" "$_embed_page" | sed -nE "s|.*file: '([^']*)'.*|\1|p" | head -n 1)"
-    anidb_curl "${_m3u8_master}" | sed 's|^#EXT-X-STREAM.*x||g; s|,.*|p|g; /^#/d; $!N; s|\n| >|;/EXT-X-I-FRAME/d'
+    printf "%s" "$_data" | grep -q '"success":true' || die "No sources found for this translation!"
+    _urlfield="$(printf "%s" "$_data" | sed -nE 's@.*"url":"([^"]*)".*@\1@p' | sed 's|\\/|/|g')"
+    links="$(printf "%s" "$_urlfield" | tr ',' '\n' | sed -nE 's@\[([0-9]+p)\].* or (.*)@\1 >\2@p' | sort -g -r -s)"
+    sub_link="$(printf "%s" "$_data" | sed -nE 's@.*"subtitle":"([^"]*)".*@\1@p' | sed -e 's|\\/|/|g' -e 's@^\[[^]]*\]@@' -e 's@,.*@@')"
 }
 
 # select the quality according to the setting
@@ -206,88 +227,53 @@ select_quality() {
     video_link=$(printf "%s" "$_result" | cut -d ">" -f 2)
 }
 
-# gets embed url, collects direct links and selects one with desired quality into $episode
+# gets stream links and selects one with desired quality into $video_link
 get_video_link() {
-    links=$(anidb_m3u8 "$ep_no" "$mode" | sort -g -r -s)
-    [ -z "$links" ] && die "No sources found for $mode!"
-    info "anidb.app links fetched"
+    hdrezka_stream "$ep_no"
+    [ -z "$links" ] && die "No sources found!"
+    info "hdrezka.website links fetched"
     select_quality "$quality"
-    # should never trigger but just in case
-    if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
-        [ -z "$video_link" ] && die "Episode is released, but no valid sources!"
-    else
-        [ -z "$video_link" ] && die "Episode not released!"
-    fi
-}
-
-# provide countdown for the next episode release both sub and dub
-time_until_next_ep() {
-    animeschedule="https://animeschedule.net"
-    _query="$(printf "%s" "$*" | tr ' ' '+')"
-    $curl_exe -s -G "$animeschedule/api/v3/anime" --data "q=${_query}" | sed 's|},{"id"|\n|g' | while read -r _entry; do
-        _route=$(printf "%s" "$_entry" | sed -nE 's|.*"route":"([^"]*)",.*|\1|p')
-        _eng_title=$(printf '%s' "$_entry" | sed -nE 's|.*"english":"([^"]*)".*|\1|p')
-        [ -z "$_eng_title" ] && _eng_title=$(printf '%s' "$_entry" | sed -nE 's|.*,"title":"([^"]*)".*|\1|p')
-        [ -z "$_eng_title" ] && _eng_title="N/A"
-        _jpn_title=$(printf '%s' "$_entry" | sed -nE 's|.*"romaji":"([^"]*)".*|\1|p')
-        [ -z "$_jpn_title" ] && _jpn_title="N/A"
-        _status=$(printf '%s' "$_entry" | sed -nE 's|.*"status":"([^"]*)".*|\1|p')
-        [ -z "$_status" ] && _status="Unknown"
-
-        case "$_status" in
-            Ongoing) _color="33" ;;
-            Finished) _color="32" ;;
-            *) _color="36" ;;
-        esac
-
-        printf "Eng: %s\n" "$_eng_title"
-        printf "Jpn: %s\n" "$_jpn_title"
-        printf "Status: \033[1;%sm%s\033[0m\n" "$_color" "$_status"
-
-        if [ "$_status" != "Finished" ]; then
-            _page="$($curl_exe -s "$animeschedule/anime/$_route")"
-            _sub_ep=$(printf "%s" "$_page" | sed -nE 's|.*release-time-type-subs"[^>]*><span class="release-time-episode-number">Episode ([0-9]+)</span>.*|\1|p' | head -n 1)
-            _dub_ep=$(printf "%s" "$_page" | sed -nE 's|.*release-time-type-dub"[^>]*><span class="release-time-episode-number">Episode ([0-9]+)</span>.*|\1|p' | head -n 1)
-            _sub_countdown=$(printf "%s" "$_page" | sed -nE 's|.*class="countdown-time" datetime="([^"]*)".*|\1|p' | head -n 1)
-            _dub_countdown=$(printf "%s" "$_page" | sed -nE 's|.*class="countdown-time countdown-time-dub" datetime="([^"]*)".*|\1|p' | head -n 1)
-
-            [ -n "$_sub_ep" ] && [ -n "$_sub_countdown" ] &&
-                printf "Next Sub: Episode %s in \033[1;%sm%s\033[0m\n" "$_sub_ep" "$_color" "$_sub_countdown" || printf "Next Sub: N/A\n"
-            [ -n "$_dub_ep" ] && [ -n "$_dub_countdown" ] &&
-                printf "Next Dub: Episode %s in \033[1;%sm%s\033[0m\n" "$_dub_ep" "$_color" "$_dub_countdown" || printf "Next Dub: N/A\n"
-        fi
-        printf "\n"
-    done
-    exit 0
+    [ -z "$video_link" ] && die "No valid sources!"
 }
 
 # HISTORY
 
 backup_old_hist() {
-    backupfile="${histfile}.v4"
+    backupfile="${histfile}.v5"
     while IFS="	" read -r ep_no anime_id anime_title; do
         case "$anime_id" in
-            *-*) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new" ;;
+            */*-*) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new" ;;
             *) printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"$backupfile" ;;
         esac
     done <"$histfile"
     mv "${histfile}.new" "$histfile"
 }
 
+# $hist_id is "path/to/anime-id" optionally followed by "#season_id"
 process_hist_entry() {
-    ep_list=$(anidb_episodes "$anime_id" | cut -f 2)
-    ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
-    [ -n "$ep_no" ] && printf "%s\t%s - episode %s\n" "$anime_id" "$anime_title" "$ep_no"
+    anime_id="${hist_id%%#*}"
+    case "$hist_id" in
+        *#*) season_id="${hist_id#*#}" ;;
+        *) season_id="" ;;
+    esac
+    hdrezka_load_page "$anime_id" 2>/dev/null || return
+    if [ "$is_movie" = 1 ]; then
+        ep_list="1"
+    else
+        ep_list="$(hdrezka_episodes "$season_id")"
+    fi
+    _next_ep=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null
+    [ -n "$_next_ep" ] && printf "%s\t%s - episode %s\n" "$hist_id" "$anime_title" "$_next_ep"
 }
 
 update_history() {
-    if grep -q "	${anime_id}	" "$histfile"; then
+    if grep -q "	${hist_id}	" "$histfile"; then
         # escape sed special chars in replacement: & and \ and delimiter |
         safe_title=$(printf "%s" "$anime_title" | sed 's|[&\|]|\\&|g')
-        sed -E "s|^[^	]+	${anime_id}	[^	]+$|${ep_no}	${anime_id}	${safe_title}|" "$histfile" >"${histfile}.new"
+        sed -E "s|^[^	]+	${hist_id}	[^	]+$|${ep_no}	${hist_id}	${safe_title}|" "$histfile" >"${histfile}.new"
     else
         cp "$histfile" "${histfile}.new"
-        printf "%s\t%s\t%s\n" "$ep_no" "$anime_id" "$anime_title" >>"${histfile}.new"
+        printf "%s\t%s\t%s\n" "$ep_no" "$hist_id" "$anime_title" >>"${histfile}.new"
     fi
     mv "${histfile}.new" "$histfile"
 }
@@ -302,22 +288,23 @@ download() {
 }
 
 play_episode() {
-    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t ani-cli "${anime_title} ${ep_no}"
-    [ "$skip_intro" = 1 ] && skip_flag="$(ani-skip -i "$mal_id" -e "$canon_ep_no")"
+    [ "$log_episode" = 1 ] && [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && command -v logger >/dev/null && logger -t comrade-cli "${anime_title} ${ep_no}"
     [ -z "$video_link" ] && get_video_link
     # wait for the previous player to close (in range selection)
     wait
+    sub_flag=""
+    [ -n "$sub_link" ] && sub_flag="--sub-file=$sub_link"
     # shellcheck disable=SC2086
     case "$player_function" in
-        debug) printf "All links:\n%s\nSelected link:\n%s\n" "$links" "$video_link" ;;
+        debug) printf "All links:\n%s\nSelected link:\n%s\nSubtitle:\n%s\n" "$links" "$video_link" "$sub_link" ;;
         android_mpv) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n is.xyz.mpv/.MPVActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
         android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$video_link" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${anime_title} Episode ${ep_no}" $player_extra_flags >/dev/null 2>&1 & ;;
-        *flatpak*mpv*) flatpak run io.mpv.Mpv $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
+        *flatpak*mpv*) flatpak run io.mpv.Mpv $sub_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 & ;;
         *mpv*)
             if [ "$no_detach" = 0 ]; then
-                nohup $player_function $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
+                nohup $player_function $sub_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link" >/dev/null 2>&1 &
             else
-                $player_function $skip_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
+                $player_function $sub_flag $player_extra_flags --force-media-title="${anime_title} Episode ${ep_no}" "$video_link"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$_range" ] && exit "$mpv_exitcode"
             fi
@@ -361,14 +348,12 @@ play() {
         for i in $_range; do
             tput clear
             ep_no=$i
-            canon_ep_no="$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/=")"
             info "Playing episode $ep_no..."
             [ "$i" = "$_end" ] && unset _range
             play_episode
         done
     else
         printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Invalid episode!"
-        canon_ep_no="$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/=")"
         play_episode
     fi
     # moves up to stored position and deletes to end
@@ -378,44 +363,29 @@ play() {
 # MAIN
 
 # setup
-base_api="https://anidb.app"
-search_api="${base_api}/browse?q=%s"
-# search_api_alt="${base_api}/search/suggestions?q=%s"
-desc_api="${base_api}/anime/%s"
-episodes_api="${base_api}/api/frontend/anime/%s/episodes"
-m3u8_api="${base_api}/api/frontend/episode/%s/languages"
+base_api="https://hdrezka.website"
+search_api="${base_api}/search/?do=search&subaction=search&q=%s"
+agent="uwu"
 
-ciphers='ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305'
-tls13_ciphers='TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256'
-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+download_dir="${COMRADE_CLI_DOWNLOAD_DIR:-.}"
+log_episode="${COMRADE_CLI_LOG:-1}"
+quality="${COMRADE_CLI_QUALITY:-best}"
 
-mode="${ANI_CLI_MODE:-sub}"
-download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"
-log_episode="${ANI_CLI_LOG:-1}"
-quality="${ANI_CLI_QUALITY:-best}"
-
-curl_exe=$(dep_ch_failover "curl_firefox135,curl_chrome136,curl_chrome116,curl_ff117,curl") || die "Program curl not found"
+dep_ch "curl"
 
 case "$(uname -a | cut -d " " -f 1,3-)" in
-    *Darwin*)
-        cipher_flag="--ciphers $ciphers --tls13-ciphers $tls13_ciphers"
-        player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}" || die 'No player found. Looked for iina, mpv and vlc'
-        ;;                                                            # mac OS
-    *ndroid*) player_function="${ANI_CLI_PLAYER:-android_mpv}" ;;     # Android OS (termux)
-    *MINGW* | *WSL2*) player_function="${ANI_CLI_PLAYER:-mpv.exe}" ;; # Windows OS
-    *ish*)
-        player_function="${ANI_CLI_PLAYER:-iSH}"
-        curl_exe=$(dep_ch_failover "curl_safari260_ios,$curl_exe")
-        ;;                                                                                                                                                                                               # iOS (iSH)
-    *) player_function="${ANI_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}" || die 'No player found. Looked for mpv and vlc' ;; # Linux OS
+    *Darwin*) player_function="${COMRADE_CLI_PLAYER:-$(dep_ch_failover "iina,/Applications/IINA.app/Contents/MacOS/iina-cli,mpv,vlc")}" || die 'No player found. Looked for iina, mpv and vlc' ;; # mac OS
+    *ndroid*) player_function="${COMRADE_CLI_PLAYER:-android_mpv}" ;;                                                                                                                                        # Android OS (termux)
+    *MINGW* | *WSL2*) player_function="${COMRADE_CLI_PLAYER:-mpv.exe}" ;;                                                                                                                                    # Windows OS
+    *ish*) player_function="${COMRADE_CLI_PLAYER:-iSH}" ;;                                                                                                                                                   # iOS (iSH)
+    *) player_function="${COMRADE_CLI_PLAYER:-$(dep_ch_failover "mpv,$HOME/.local/share/flatpak/app/io.mpv.Mpv/,/var/lib/flatpak/app/io.mpv.Mpv/,vlc")}" || die 'No player found. Looked for mpv and vlc' ;; # Linux OS
 esac
 
-player_extra_flags="${ANI_CLI_PLAYER_FLAGS:-""}"
-no_detach="${ANI_CLI_NO_DETACH:-0}"
-exit_after_play="${ANI_CLI_EXIT_AFTER_PLAY:-0}"
-skip_intro="${ANI_CLI_SKIP_INTRO:-0}"
-menu_program="${ANI_CLI_MENU:-fzf}"
-menu_extra_flags="${ANI_CLI_MENU_FLAGS:-""}"
+player_extra_flags="${COMRADE_CLI_PLAYER_FLAGS:-""}"
+no_detach="${COMRADE_CLI_NO_DETACH:-0}"
+exit_after_play="${COMRADE_CLI_EXIT_AFTER_PLAY:-0}"
+menu_program="${COMRADE_CLI_MENU:-fzf}"
+menu_extra_flags="${COMRADE_CLI_MENU_FLAGS:-""}"
 
 # not opening from a terminal
 if [ ! -t 0 ]; then
@@ -423,13 +393,14 @@ if [ ! -t 0 ]; then
     command -v rofi >/dev/null && menu_program=rofi
 fi
 
-hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
+hist_dir="${COMRADE_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/comrade-cli}"
 [ ! -d "$hist_dir" ] && mkdir -p "$hist_dir"
 histfile="$hist_dir/ani-hsts"
 [ ! -f "$histfile" ] && : >"$histfile"
+cookie_jar="$(mktemp)"
 
-source="${ANI_CLI_DEFAULT_SOURCE:-search}"
-branch="${ANI_CLI_BRANCH:-master}"
+source="${COMRADE_CLI_DEFAULT_SOURCE:-search}"
+branch="${COMRADE_CLI_BRANCH:-master}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -472,7 +443,7 @@ while [ $# -gt 0 ]; do
         -l | --logview)
             case "$(uname -s)" in
                 Darwin*) log show --predicate 'process == "logger"' ;;
-                Linux*) journalctl -t ani-cli ;;
+                Linux*) journalctl -t comrade-cli ;;
                 *) die "Logger not implemented for your platform" ;;
             esac
             exit 0
@@ -484,13 +455,10 @@ while [ $# -gt 0 ]; do
             ep_no="$2"
             shift
             ;;
-        --dub) mode="dub" ;;
         --no-detach) no_detach=1 ;;
         --exit-after-play) exit_after_play=1 && no_detach=1 ;;
         --rofi) menu_program=rofi ;;
         --dmenu) menu_program=dmenu ;;
-        --skip) skip_intro=1 ;;
-        -N | --nextep-countdown) source=nextep ;;
         -U | --update)
             dep_ch "patch"
             branch="${2:-$branch}"
@@ -507,7 +475,6 @@ done
 info "Checking dependencies..."
 dep_ch "sed"
 dep_ch "grep"
-[ "$skip_intro" = 1 ] && dep_ch "ani-skip"
 dep_ch "$menu_program" # TODO: use dep_ch_failover to iterate through options
 
 case "$player_function" in
@@ -526,42 +493,69 @@ trap 'cleanup; exit 1' INT HUP TERM
 case "$source" in
     history)
         backup_old_hist
-        anime_list=$(while read -r ep_no anime_id anime_title; do process_hist_entry & done <"$histfile")
+        anime_list=$(while read -r ep_no hist_id anime_title; do process_hist_entry & done <"$histfile")
         wait
         [ -z "$anime_list" ] && die "No unwatched series in history!"
-        [ -z "${index##*[!0-9]*}" ] && anime_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
-        [ -z "${index##*[!0-9]*}" ] || anime_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
-        [ -z "$anime_id" ] && exit 1
-        anime_title=$(printf "%s" "$anime_list" | grep "^$anime_id	" | cut -f 2 | sed 's| - episode.*||')
-        anidb_desc "$anime_id" || true
-        episode_maps="$(anidb_episodes "$anime_id")"
-        ep_list="$(printf "%s" "$episode_maps" | cut -f 2)"
-        ep_no=$(printf "%s" "$anime_list" | grep "^$anime_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
+        [ -z "${index##*[!0-9]*}" ] && hist_id=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: " | cut -f 1)
+        [ -z "${index##*[!0-9]*}" ] || hist_id=$(printf "%s" "$anime_list" | sed -n "${index}p" | cut -f 1)
+        [ -z "$hist_id" ] && exit 1
+        anime_title=$(printf "%s" "$anime_list" | grep "^$hist_id	" | cut -f 2 | sed 's| - episode.*||')
+        anime_id="${hist_id%%#*}"
+        case "$hist_id" in
+            *#*) season_id="${hist_id#*#}" ;;
+            *) season_id="" ;;
+        esac
+        hdrezka_load_page "$anime_id"
+        if [ "$is_movie" = 1 ]; then
+            ep_list="1"
+        else
+            ep_list="$(hdrezka_episodes "$season_id")"
+        fi
+        translator_id="$(hdrezka_default_translator)"
+        ep_no=$(printf "%s" "$anime_list" | grep "^$hist_id	" | sed -nE 's/.*- episode (.+)$/\1/p')
         ;;
     *)
         if [ "$menu_program" = "fzf" ]; then
             while [ -z "$query" ]; do
-                printf "\33[2K\r\033[1;36mSearch anime: \033[0m" && read -r query
+                printf "\33[2K\r\033[1;36mSearch: \033[0m" && read -r query
             done
         else
-            [ -z "$query" ] && query=$(: | menu "Search anime: " "" "$menu_extra_flags")
+            [ -z "$query" ] && query=$(: | menu "Search: " "" "$menu_extra_flags")
             [ -z "$query" ] && exit 1
         fi
-        # for checking new releases by specifying anime name
-        [ "$source" = "nextep" ] && time_until_next_ep "$query"
 
         query=$(printf "%s" "$query" | sed 's| |+|g')
 
-        anime_list=$(anidb_search "$query")
+        anime_list=$(hdrezka_search "$query")
         [ -z "$anime_list" ] && die "No results found!"
         [ "$index" -eq "$index" ] 2>/dev/null && result=$(printf "%s" "$anime_list" | sed -n "${index}p")
-        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select anime: ")
-        [ -z "$result" ] && die "Invalid anime selection"
+        [ -z "$index" ] && result=$(printf "%s" "$anime_list" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select: ")
+        [ -z "$result" ] && die "Invalid selection"
         anime_title="$(printf "%s" "$result" | cut -f 2)"
         anime_id="$(printf "%s" "$result" | cut -f 1)"
-        anidb_desc "$anime_id" || true
-        episode_maps="$(anidb_episodes "$anime_id")"
-        ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
+        hdrezka_load_page "$anime_id"
+        if [ "$is_movie" = 1 ]; then
+            ep_list="1"
+            season_id=""
+            hist_id="$anime_id"
+        else
+            seasons="$(hdrezka_seasons)"
+            if [ "$(printf "%s\n" "$seasons" | wc -l | tr -d "[:space:]")" -gt 1 ]; then
+                season_id=$(printf "%s" "$seasons" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select season: " | cut -f 1)
+                [ -z "$season_id" ] && die "Invalid season selection"
+            else
+                season_id=$(printf "%s" "$seasons" | cut -f 1)
+            fi
+            hist_id="${anime_id}#${season_id}"
+            ep_list="$(hdrezka_episodes "$season_id")"
+        fi
+        translators="$(hdrezka_translators)"
+        if [ -z "$translators" ]; then
+            translator_id="$(hdrezka_default_translator)"
+        else
+            translator_id=$(printf "%s" "$translators" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select translation: " | cut -f 1)
+            [ -z "$translator_id" ] && die "Invalid translation selection"
+        fi
         [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
         [ -z "$ep_no" ] && die "Invalid episode selection"
         ;;
@@ -576,23 +570,31 @@ tput sc
 play
 [ "$player_function" = "download" ] || [ "$player_function" = "debug" ] && exit 0
 
+seasons_option=""
+[ "$is_movie" = 0 ] && [ "$(printf "%s\n" "$seasons" | wc -l | tr -d "[:space:]")" -gt 1 ] && seasons_option="\nchange_season"
+translator_option=""
+[ "$(printf "%s\n" "$translators" | wc -l | tr -d "[:space:]")" -gt 1 ] && translator_option="\nchange_translator"
+
 #shellcheck disable=SC2059
-while cmd=$(printf "next\nreplay\nprevious\nselect$seasons_option\nchange_quality\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
+while cmd=$(printf "next\nreplay\nprevious\nselect${seasons_option}${translator_option}\nchange_quality\nquit" | nth "Playing episode $ep_no of $anime_title... "); do
     case "$cmd" in
         next) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}") 2>/dev/null ;;
         replay) video_link="$replay" ;;
         previous) ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{g;1!p;};h") 2>/dev/null ;;
         select) ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag") ;;
         change_season)
-            new_anime="$(printf "%s" "$seasons" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select season: ")"
-            [ -z "$new_anime" ] && die "Invalid season selection"
-            anime_title="$(printf "%s" "$new_anime" | cut -f 2)"
-            anime_id="$(printf "%s" "$new_anime" | cut -f 1)"
-            anidb_desc "$anime_id" || true
-            episode_maps="$(anidb_episodes "$anime_id")"
-            ep_list="$(printf '%s' "$episode_maps" | cut -f 2)"
+            new_season="$(printf "%s" "$seasons" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select season: ")"
+            [ -z "$new_season" ] && die "Invalid season selection"
+            season_id="$(printf "%s" "$new_season" | cut -f 1)"
+            hist_id="${anime_id}#${season_id}"
+            ep_list="$(hdrezka_episodes "$season_id")"
             ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$menu_multi_flag")
             [ -z "$ep_no" ] && die "Invalid episode selection"
+            ;;
+        change_translator)
+            new_translator="$(printf "%s" "$translators" | nl -w 2 | sed 's/^[[:space:]]//' | nth "Select translation: ")"
+            [ -z "$new_translator" ] && die "Invalid translation selection"
+            translator_id="$(printf "%s" "$new_translator" | cut -f 1)"
             ;;
         change_quality)
             new_quality="$(printf "%s" "$links" | menu "Select Quality: " "" "$menu_extra_flags" | cut -d ">" -f 1)"
@@ -608,7 +610,7 @@ while cmd=$(printf "next\nreplay\nprevious\nselect$seasons_option\nchange_qualit
     play
 done
 
-# ani-cli
+# comrade-cli
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -623,4 +625,5 @@ done
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 #
-# Project repository: https://github.com/pystardust/ani-cli
+# Project repository: https://github.com/justchokingaround/comrade-cli
+# Forked from: https://github.com/pystardust/ani-cli
