@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="6.0.0"
+version_number="6.0.1"
 
 # UI
 
@@ -545,6 +545,9 @@ case "$source" in
                 [ -z "$season_id" ] && die "Invalid season selection"
             else
                 season_id=$(printf "%s" "$seasons" | cut -f 1)
+                # hdrezka omits season tabs for single-season titles but still tags
+                # episodes with data-season_id="0" in the markup, so default to that
+                [ -z "$season_id" ] && season_id=0
             fi
             hist_id="${anime_id}#${season_id}"
             ep_list="$(hdrezka_episodes "$season_id")"
